@@ -56,27 +56,51 @@ REQUESTED and switched to its own VALUE.")
   "Return live agent shell buffers."
   (seq-filter #'buffer-live-p (agent-shell-buffers)))
 
-(defun agent-shell-ctl--find (name)
+(defun agent-shell-ctl--find (name &optional session-id)
   "Return the shell buffer designated by NAME.
 
 Matches an exact buffer name first, then falls back to a
-case-insensitive substring match, which must be unique."
-  (or (seq-find (lambda (buffer) (equal (buffer-name buffer) name))
-                (agent-shell-ctl--sessions))
-      (let ((matches (seq-filter
-                      (lambda (buffer)
-                        (string-match-p (regexp-quote (downcase name))
-                                        (downcase (buffer-name buffer))))
-                      (agent-shell-ctl--sessions))))
+case-insensitive substring match, which must be unique.
+
+With SESSION-ID, only a buffer whose ACP session id is SESSION-ID
+matches, and when NAME is non-empty it must also be named exactly
+NAME.  Buffer names are reused, so this is what keeps a caller that
+pinned a session's id from reaching a different session started under
+the same name.  A resumed session can be open in two buffers with one
+id; that is ambiguous unless NAME picks one."
+  (if session-id
+      (let ((matches (and (not (member session-id '("" "-")))
+                          (seq-filter
+                           (lambda (buffer)
+                             (and (or (string-empty-p name)
+                                      (equal (buffer-name buffer) name))
+                                  (equal (agent-shell-ctl--session-id buffer)
+                                         session-id)))
+                           (agent-shell-ctl--sessions)))))
         (pcase (length matches)
           (1 (car matches))
-          (0 (user-error "No agent session matching %S.  Known: %s" name
-                         (or (string-join (mapcar #'buffer-name
-                                                  (agent-shell-ctl--sessions))
-                                          ", ")
-                             "none")))
-          (_ (user-error "Ambiguous session %S, matches: %s" name
-                         (string-join (mapcar #'buffer-name matches) ", ")))))))
+          (0 (if (string-empty-p name)
+                 (user-error "No agent session with ACP session id %s" session-id)
+               (user-error "No agent session %s with ACP session id %s"
+                           name session-id)))
+          (_ (user-error "Ambiguous ACP session id %s, matches: %s" session-id
+                         (string-join (mapcar #'buffer-name matches) ", ")))))
+    (or (seq-find (lambda (buffer) (equal (buffer-name buffer) name))
+                  (agent-shell-ctl--sessions))
+        (let ((matches (seq-filter
+                        (lambda (buffer)
+                          (string-match-p (regexp-quote (downcase name))
+                                          (downcase (buffer-name buffer))))
+                        (agent-shell-ctl--sessions))))
+          (pcase (length matches)
+            (1 (car matches))
+            (0 (user-error "No agent session matching %S.  Known: %s" name
+                           (or (string-join (mapcar #'buffer-name
+                                                    (agent-shell-ctl--sessions))
+                                            ", ")
+                               "none")))
+            (_ (user-error "Ambiguous session %S, matches: %s" name
+                           (string-join (mapcar #'buffer-name matches) ", "))))))))
 
 (defun agent-shell-ctl--agent (buffer)
   "Return the agent identifier of BUFFER as a string."
@@ -287,13 +311,14 @@ shows the buffer."
         (agent-shell--display-buffer buffer))
       (buffer-name buffer))))
 
-(defun agent-shell-ctl-send (name prompt-file steer)
+(defun agent-shell-ctl-send (name prompt-file steer &optional session-id)
   "Send the contents of PROMPT-FILE to session NAME.
 
 Returns the turn count observed before sending, so the caller can wait
 for it to advance.  STEER non-nil injects the prompt into the running
-turn instead of queueing it."
-  (let* ((buffer (agent-shell-ctl--find name))
+turn instead of queueing it.  SESSION-ID pins NAME as in
+`agent-shell-ctl--find'."
+  (let* ((buffer (agent-shell-ctl--find name session-id))
          (prompt (with-temp-buffer
                    (insert-file-contents prompt-file)
                    (string-trim-right (buffer-string))))
@@ -320,14 +345,15 @@ turn instead of queueing it."
          :text prompt :submit t :no-focus t)
         (format "sent\t%s" turns))))))
 
-(defun agent-shell-ctl-output (name mode lines)
+(defun agent-shell-ctl-output (name mode lines &optional session-id)
   "Return output from session NAME.
 
 MODE is \"last\" for the agent's final message of the last completed
 turn, \"tail\" for the last LINES lines, or \"all\" for the whole
 transcript.  \"last\" falls back to the rendered latest response until
-a turn completes under `agent-shell-ctl--ensure-tracking'."
-  (let ((buffer (agent-shell-ctl--find name))
+a turn completes under `agent-shell-ctl--ensure-tracking'.  SESSION-ID
+pins NAME as in `agent-shell-ctl--find'."
+  (let ((buffer (agent-shell-ctl--find name session-id))
         (lines (if (stringp lines) (string-to-number lines) lines)))
     (agent-shell-ctl--ensure-tracking buffer)
     (with-current-buffer buffer
@@ -349,24 +375,27 @@ a turn completes under `agent-shell-ctl--ensure-tracking'."
                (buffer-substring-no-properties (region-beginning) (region-end)))
            (user-error "Session %s has no running agent" (buffer-name buffer))))))))
 
-(defun agent-shell-ctl-status (name)
-  "Return the description line for session NAME."
-  (agent-shell-ctl--describe (agent-shell-ctl--find name)))
+(defun agent-shell-ctl-status (name &optional session-id)
+  "Return the description line for session NAME, pinned to SESSION-ID."
+  (agent-shell-ctl--describe (agent-shell-ctl--find name session-id)))
 
-(defun agent-shell-ctl-config (name)
-  "Return session NAME's model, mode and thought level, tab-separated."
-  (with-current-buffer (agent-shell-ctl--find name)
+(defun agent-shell-ctl-config (name &optional session-id)
+  "Return session NAME's model, mode and thought level, tab-separated.
+
+SESSION-ID pins NAME as in `agent-shell-ctl--find'."
+  (with-current-buffer (agent-shell-ctl--find name session-id)
     (string-join (mapcar (lambda (option)
                            (or (agent-shell-ctl--value (car option)) "-"))
                          agent-shell-ctl--options)
                  "\t")))
 
-(defun agent-shell-ctl-check (name)
+(defun agent-shell-ctl-check (name &optional session-id)
   "Return \"pending\" until session NAME has initialized, then \"ready\".
 
 Signal an error naming every config option `new' requested that the
-agent did not apply, and the values it offers instead."
-  (let ((buffer (agent-shell-ctl--find name)))
+agent did not apply, and the values it offers instead.  SESSION-ID
+pins NAME as in `agent-shell-ctl--find'."
+  (let ((buffer (agent-shell-ctl--find name session-id)))
     (with-current-buffer buffer
       (let ((model (alist-get "model" agent-shell-ctl--requested nil nil #'equal)))
         (cond
@@ -389,9 +418,11 @@ agent did not apply, and the values it offers instead."
             (user-error "Agent did not apply %s" (string-join mismatches "; ")))
           "ready"))))))
 
-(defun agent-shell-ctl-kill (name)
-  "Kill session NAME, shutting down its ACP client."
-  (let* ((buffer (agent-shell-ctl--find name))
+(defun agent-shell-ctl-kill (name &optional session-id)
+  "Kill session NAME, shutting down its ACP client.
+
+SESSION-ID pins NAME as in `agent-shell-ctl--find'."
+  (let* ((buffer (agent-shell-ctl--find name session-id))
          (killed (buffer-name buffer)))
     ;; `agent-shell--clean-up' runs from `kill-buffer-hook' and shuts the
     ;; ACP client down; `kill-buffer-query-functions' would otherwise ask.

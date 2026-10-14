@@ -56,6 +56,13 @@ ash() {
   ash_raw "${args[*]-}"
 }
 
+# Same, for a command that resolves --session: appends --session-id when
+# given, so the session is pinned in the same Emacs evaluation that runs
+# the command.
+ash_session() {
+  if [ -n "$session_id" ]; then ash "$@" "$session_id"; else ash "$@"; fi
+}
+
 repo_root() {
   git -C "${1:-.}" rev-parse --show-toplevel 2>/dev/null || die "not a git repository: ${1:-.}"
 }
@@ -101,7 +108,7 @@ wait_turn() {
   local session=$1 since=$2 timeout=$3 deadline line turns state
   deadline=$(( $(date +%s) + timeout ))
   while :; do
-    line=$(ash status "$session")
+    line=$(ash_session status "$session")
     turns=$(printf '%s' "$line" | cut -f4)
     state=$(printf '%s' "$line" | cut -f2)
     if [ "$turns" -gt "$since" ]; then printf '%s\n' "$line"; return 0; fi
@@ -120,12 +127,12 @@ usage() {
 #
 #   agents                          List agent types (claude-code, codex, ...).
 #   list                            Sessions as: NAME STATUS AGENT TURNS DIR SESSION-ID.
-#   status   --session S            One session's line.
-#   config   --session S            Its config as: MODEL MODE THOUGHT-LEVEL.
-#   output   --session S [--last|--tail N|--all]
-#   send     --session S (--prompt T|--prompt-file F) [--steer] [--wait] [--timeout N]
-#   wait     --session S [--since N] [--timeout N]
-#   kill     --session S
+#   status   SESSION                One session's line.
+#   config   SESSION                Its config as: MODEL MODE THOUGHT-LEVEL.
+#   output   SESSION [--last|--tail N|--all]
+#   send     SESSION (--prompt T|--prompt-file F) [--steer] [--wait] [--timeout N]
+#   wait     SESSION [--since N] [--timeout N]
+#   kill     SESSION
 #
 #   new      --agent A [--dir D] [--mode M] [--model M] [--effort E] [--display]
 #   spawn    --agent A (--prompt T|--prompt-file F)
@@ -136,7 +143,12 @@ usage() {
 #   worktree-list   [--repo R]
 #   worktree-remove --worktree W [--force] [--delete-branch]
 #
-# Session names match on an exact buffer name or a unique substring.
+# SESSION is --session S, --session-id ID, or both.
+# --session S matches an exact buffer name or a unique substring.
+# --session-id ID matches the session with that ACP id (SESSION-ID in
+# list), checked in the same Emacs call as the command; with --session S
+# too, S must be its exact name. No match fails with "No agent session
+# [S ]with ACP session id ID".
 # output --last (the default) is the agent's final message of the last
 # completed turn, as markdown; --tail/--all are rendered buffer text.
 # Statuses: ready (idle), busy (working), blocked (a permission prompt is
@@ -149,7 +161,7 @@ usage() {
 cmd=${1:-}
 if [ $# -gt 0 ]; then shift; fi
 
-agent='' dir='' repo='' mode='' model='' effort='' session='' prompt='' prompt_file=''
+agent='' dir='' repo='' mode='' model='' effort='' session='' session_id='' prompt='' prompt_file=''
 worktree='' name='' branch='' base='' since='' line='' state=''
 display=nil steer=nil do_wait=0 timeout=600 out_mode=last tail_lines=50 force=0 del_branch=0
 
@@ -162,6 +174,7 @@ while [ $# -gt 0 ]; do
     --model) model=$2; shift 2;;
     --effort) effort=$2; shift 2;;
     --session) session=$2; shift 2;;
+    --session-id) session_id=$2; [ -n "$session_id" ] || die "empty --session-id"; shift 2;;
     --prompt) prompt=$2; shift 2;;
     --prompt-file) prompt_file=$2; shift 2;;
     --worktree) worktree=$2; shift 2;;
@@ -182,6 +195,13 @@ while [ $# -gt 0 ]; do
     *) die "unknown option: $1";;
   esac
 done
+
+if [ -n "$session_id" ]; then
+  case $cmd in
+    status|config|output|send|wait|kill) ;;
+    *) die "--session-id does not apply to ${cmd:-this command}";;
+  esac
+fi
 
 # Create <repo>/.agent-shell/worktrees/<name>, echoing the path.
 make_worktree() {
@@ -211,7 +231,8 @@ start_session() {
 send_prompt() {
   local target=$1 pf result
   pf=$(prompt_file_from "$prompt" "$prompt_file")
-  result=$(ash_raw "$(elstr send)" "$(elstr "$target")" "$(elstr "$pf")" "$steer")
+  result=$(ash_raw "$(elstr send)" "$(elstr "$target")" "$(elstr "$pf")" "$steer" \
+                   ${session_id:+"$(elstr "$session_id")"})
   if [ -z "$prompt_file" ]; then rm -f "$pf"; fi
   printf '%s\n' "$result"
   if [ "$do_wait" = 1 ]; then
@@ -223,28 +244,28 @@ case $cmd in
   agents|list) ash "$cmd";;
 
   status)
-    [ -n "$session" ] || die "missing --session"
-    ash status "$session";;
+    [ -n "$session$session_id" ] || die "missing --session"
+    ash_session status "$session";;
 
   config)
-    [ -n "$session" ] || die "missing --session"
-    ash config "$session";;
+    [ -n "$session$session_id" ] || die "missing --session"
+    ash_session config "$session";;
 
   output)
-    [ -n "$session" ] || die "missing --session"
-    ash output "$session" "$out_mode" "$tail_lines";;
+    [ -n "$session$session_id" ] || die "missing --session"
+    ash_session output "$session" "$out_mode" "$tail_lines";;
 
   kill)
-    [ -n "$session" ] || die "missing --session"
-    ash kill "$session";;
+    [ -n "$session$session_id" ] || die "missing --session"
+    ash_session kill "$session";;
 
   wait)
-    [ -n "$session" ] || die "missing --session"
+    [ -n "$session$session_id" ] || die "missing --session"
     if [ -z "$since" ]; then
       # No baseline given: wait out whatever is in flight. An idle session
       # has nothing to wait for. (Subtracting 1 from the turn count here
       # would make wait_turn's `turns > since' true on the spot.)
-      line=$(ash status "$session")
+      line=$(ash_session status "$session")
       state=$(printf '%s' "$line" | cut -f2)
       if [ "$state" = "ready" ]; then printf '%s\n' "$line"; exit 0; fi
       since=$(printf '%s' "$line" | cut -f4)
@@ -256,7 +277,7 @@ case $cmd in
     start_session; echo;;
 
   send)
-    [ -n "$session" ] || die "missing --session"
+    [ -n "$session$session_id" ] || die "missing --session"
     send_prompt "$session";;
 
   spawn)
